@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/textproto"
+	"time"
 
 	"github.com/gophish/gomail"
 	log "github.com/gophish/gophish/logger"
@@ -13,6 +14,10 @@ import (
 
 // MaxReconnectAttempts is the maximum number of times we should reconnect to a server
 var MaxReconnectAttempts = 10
+
+// Rate limit for sending emails (emails per minute)
+var emailsPerMinute = 10
+var rateLimit = time.Minute / time.Duration(emailsPerMinute)
 
 // ErrMaxConnectAttempts is thrown when the maximum number of reconnect attempts
 // is reached.
@@ -135,9 +140,7 @@ func dialHost(ctx context.Context, dialer Dialer) (Sender, error) {
 	return sender, err
 }
 
-// sendMail attempts to send the provided Mail instances.
-// If the context is cancelled before all of the mail are sent,
-// sendMail just returns and does not modify those emails.
+// sendMail attempts to send the provided Mail instances with rate limiting.
 func sendMail(ctx context.Context, dialer Dialer, ms []Mail) {
 	sender, err := dialHost(ctx, dialer)
 	if err != nil {
@@ -146,87 +149,70 @@ func sendMail(ctx context.Context, dialer Dialer, ms []Mail) {
 		return
 	}
 	defer sender.Close()
+
 	message := gomail.NewMessage()
+	ticker := time.NewTicker(rateLimit)
+	defer ticker.Stop()
+
 	for i, m := range ms {
 		select {
 		case <-ctx.Done():
 			return
-		default:
-			break
-		}
-		message.Reset()
-		err = m.Generate(message)
-		if err != nil {
-			log.Warn(err)
-			m.Error(err)
-			continue
-		}
-
-		smtp_from, err := m.GetSmtpFrom()
-		if err != nil {
-			m.Error(err)
-			continue
-		}
-
-		err = gomail.SendCustomFrom(sender, smtp_from, message)
-		if err != nil {
-			if te, ok := err.(*textproto.Error); ok {
-				switch {
-				// If it's a temporary error, we should backoff and try again later.
-				// We'll reset the connection so future messages don't incur a
-				// different error (see https://github.com/gophish/gophish/issues/787).
-				case te.Code >= 400 && te.Code <= 499:
-					log.WithFields(logrus.Fields{
-						"code":  te.Code,
-						"email": message.GetHeader("To")[0],
-					}).Warn(err)
-					m.Backoff(err)
-					sender.Reset()
-					continue
-				// Otherwise, if it's a permanent error, we shouldn't backoff this message,
-				// since the RFC specifies that running the same commands won't work next time.
-				// We should reset our sender and error this message out.
-				case te.Code >= 500 && te.Code <= 599:
-					log.WithFields(logrus.Fields{
-						"code":  te.Code,
-						"email": message.GetHeader("To")[0],
-					}).Warn(err)
-					m.Error(err)
-					sender.Reset()
-					continue
-				// If something else happened, let's just error out and reset the
-				// sender
-				default:
-					log.WithFields(logrus.Fields{
-						"code":  "unknown",
-						"email": message.GetHeader("To")[0],
-					}).Warn(err)
-					m.Error(err)
-					sender.Reset()
-					continue
-				}
-			} else {
-				// This likely indicates that something happened to the underlying
-				// connection. We'll try to reconnect and, if that fails, we'll
-				// error out the remaining emails.
-				log.WithFields(logrus.Fields{
-					"email": message.GetHeader("To")[0],
-				}).Warn(err)
-				origErr := err
-				sender, err = dialHost(ctx, dialer)
-				if err != nil {
-					errorMail(err, ms[i:])
-					break
-				}
-				m.Backoff(origErr)
+		case <-ticker.C: // Rate limit trigger
+			message.Reset()
+			err = m.Generate(message)
+			if err != nil {
+				log.Warn(err)
+				m.Error(err)
 				continue
 			}
+
+			smtp_from, err := m.GetSmtpFrom()
+			if err != nil {
+				m.Error(err)
+				continue
+			}
+
+			err = gomail.SendCustomFrom(sender, smtp_from, message)
+			if err != nil {
+				handleSendError(err, m, sender, message, ms, i, ctx, dialer)
+				continue
+			}
+
+			log.WithFields(logrus.Fields{
+				"smtp_from":     smtp_from,
+				"envelope_from": message.GetHeader("From")[0],
+				"email":         message.GetHeader("To")[0],
+			}).Info("Email sent")
+			m.Success()
 		}
-		log.WithFields(logrus.Fields{
-			"smtp_from":     smtp_from,
-			"envelope_from": message.GetHeader("From")[0],
-			"email":         message.GetHeader("To")[0],
-		}).Info("Email sent")
-		m.Success()
+	}
+}
+
+func handleSendError(err error, m Mail, sender Sender, message *gomail.Message, ms []Mail, index int, ctx context.Context, dialer Dialer) {
+	if te, ok := err.(*textproto.Error); ok {
+		switch {
+		case te.Code >= 400 && te.Code <= 499:
+			log.WithFields(logrus.Fields{"code": te.Code, "email": message.GetHeader("To")[0]}).Warn(err)
+			m.Backoff(err)
+			sender.Reset()
+		case te.Code >= 500 && te.Code <= 599:
+			log.WithFields(logrus.Fields{"code": te.Code, "email": message.GetHeader("To")[0]}).Warn(err)
+			m.Error(err)
+			sender.Reset()
+		default:
+			log.WithFields(logrus.Fields{"code": "unknown", "email": message.GetHeader("To")[0]}).Warn(err)
+			m.Error(err)
+			sender.Reset()
+		}
+	} else {
+		log.WithFields(logrus.Fields{"email": message.GetHeader("To")[0]}).Warn(err)
+		origErr := err
+		if newSender, dialErr := dialHost(ctx, dialer); dialErr == nil {
+			sender = newSender
+			m.Backoff(origErr)
+		} else {
+			errorMail(dialErr, ms[index:])
+		}
 	}
 }
